@@ -11,6 +11,7 @@ import {
 
 const ACCOUNT_ACTION_OPEN_USAGE = "open-usage";
 const ACCOUNT_ACTION_SET_CURRENT = "set-current";
+const ACCOUNT_ACTION_SYNC_CODEX_APP = "sync-codex-app";
 const ACCOUNT_ACTION_DELETE = "delete";
 
 let accountRowsEventsBound = false;
@@ -214,6 +215,21 @@ function createUpdatedCell(usage) {
   return cellUpdated;
 }
 
+function isTauriRuntime() {
+  return Boolean(window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke);
+}
+
+function isLoopbackServiceAddr() {
+  const raw = String(state.serviceAddr || "").trim();
+  if (!raw) return true;
+  const withoutProtocol = raw.replace(/^https?:\/\//, "");
+  const authority = withoutProtocol.split("/")[0] || "";
+  if (!authority) return true;
+  if (!authority.includes(":")) return true;
+  const host = authority.slice(0, authority.lastIndexOf(":")).trim();
+  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(host);
+}
+
 function createActionsCell(isDeletable) {
   const cellActions = document.createElement("td");
   const actionsWrap = document.createElement("div");
@@ -230,6 +246,15 @@ function createActionsCell(isDeletable) {
   setCurrent.setAttribute("data-action", ACCOUNT_ACTION_SET_CURRENT);
   setCurrent.textContent = "切到当前";
   actionsWrap.appendChild(setCurrent);
+
+  if (isTauriRuntime()) {
+    const syncCodexApp = document.createElement("button");
+    syncCodexApp.className = "secondary";
+    syncCodexApp.type = "button";
+    syncCodexApp.setAttribute("data-action", ACCOUNT_ACTION_SYNC_CODEX_APP);
+    syncCodexApp.textContent = "同步到 Codex App";
+    actionsWrap.appendChild(syncCodexApp);
+  }
 
   if (isDeletable) {
     const del = document.createElement("button");
@@ -251,6 +276,17 @@ function syncSetCurrentButton(actionsWrap, status) {
   const disabled = level === "warn" || level === "bad";
   btn.disabled = disabled;
   btn.title = disabled ? `账号当前不可用（${status?.text || "不可用"}），不参与网关选路` : "锁定为当前账号（异常前持续优先使用）";
+}
+
+function syncCodexAppButton(actionsWrap) {
+  if (!actionsWrap) return;
+  const btn = actionsWrap.querySelector(`button[data-action="${ACCOUNT_ACTION_SYNC_CODEX_APP}"]`);
+  if (!btn) return;
+  const localService = isLoopbackServiceAddr();
+  btn.disabled = !localService;
+  btn.title = localService
+    ? "同步到官方 Codex App（会同时影响官方 Codex CLI）"
+    : "仅支持桌面端连接本机 service 时同步到 Codex App";
 }
 
 function renderEmptyRow(message) {
@@ -284,6 +320,7 @@ function renderAccountRow(account, accountDerivedMap, { onDelete }) {
   const actionsCell = createActionsCell(Boolean(onDelete));
   row.appendChild(actionsCell);
   syncSetCurrentButton(actionsCell.querySelector(".cell-actions"), accountDerived.status);
+  syncCodexAppButton(actionsCell.querySelector(".cell-actions"));
   return row;
 }
 
@@ -398,6 +435,7 @@ function updateAccountRow(row, account, accountDerivedMap, { onDelete }) {
   const actionsWrap = row.children[5]?.querySelector?.(".cell-actions");
   syncDeleteButton(actionsWrap, Boolean(onDelete));
   syncSetCurrentButton(actionsWrap, accountDerived.status);
+  syncCodexAppButton(actionsWrap);
   return row;
 }
 
@@ -465,6 +503,10 @@ export function handleAccountRowsClick(target, handlers = accountRowHandlers, lo
     handlers?.onSetCurrentAccount?.(account);
     return true;
   }
+  if (action === ACCOUNT_ACTION_SYNC_CODEX_APP) {
+    handlers?.onSyncCodexApp?.(account);
+    return true;
+  }
   if (action === ACCOUNT_ACTION_DELETE) {
     handlers?.onDelete?.(account);
     return true;
@@ -503,10 +545,16 @@ function ensureAccountRowsEventsBound() {
 }
 
 // 渲染账号列表
-export function renderAccounts({ onUpdateSort, onOpenUsage, onSetCurrentAccount, onDelete }) {
+export function renderAccounts({
+  onUpdateSort,
+  onOpenUsage,
+  onSetCurrentAccount,
+  onSyncCodexApp,
+  onDelete,
+}) {
   ensureAccountRowsEventsBound();
   renderAccountsRefreshProgress();
-  accountRowHandlers = { onUpdateSort, onOpenUsage, onSetCurrentAccount, onDelete };
+  accountRowHandlers = { onUpdateSort, onOpenUsage, onSetCurrentAccount, onSyncCodexApp, onDelete };
   syncGroupFilterSelect(getGroupOptions(state.accountList), state.accountList);
   const accountDerivedMap = getAccountDerivedMapCached(state.accountList, state.usageList);
 

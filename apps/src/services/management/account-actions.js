@@ -310,6 +310,47 @@ export function createAccountActions({
     });
   }
 
+  async function syncAccountToCodexApp(account) {
+    if (!account || !account.id) return;
+    let status = null;
+    try {
+      status = await api.codexAppStatus();
+    } catch (err) {
+      const msg = err && err.message ? err.message : "读取 Codex App 状态失败";
+      showToast(String(msg), "error");
+      return;
+    }
+    if (!status?.supported) {
+      showToast(status?.reason || "当前环境不支持同步到 Codex App", "error");
+      return;
+    }
+
+    const confirmed = await showConfirmDialog({
+      title: "同步到 Codex App",
+      message: `确定将账号 ${account.label || account.id} 同步到官方 Codex App 吗？这会覆盖本机官方 Codex 登录态，并自动重启 Codex App，同时影响官方 Codex CLI。`,
+      confirmText: "立即同步",
+      cancelText: "取消",
+    });
+    if (!confirmed) return;
+
+    await enqueueAccountOp(async () => {
+      try {
+        const result = await api.codexAppSyncAccount(account.id);
+        if (result?.launched) {
+          showToast(`已同步到 Codex App：${account.label || result.chatgptAccountId}`);
+          return;
+        }
+        showToast(
+          `官方登录态已切换为 ${account.label || result?.chatgptAccountId || account.id}，但 Codex App 未成功启动`,
+          "error",
+        );
+      } catch (err) {
+        const msg = err && err.message ? err.message : "同步到 Codex App 失败";
+        showToast(String(msg), "error");
+      }
+    });
+  }
+
   async function deleteUnavailableFreeAccounts() {
     const confirmed = await showConfirmDialog({
       title: "一键移除不可用免费账号",
@@ -482,8 +523,8 @@ export function createAccountActions({
     importAccountsFromFiles,
     importAccountsFromDirectory,
     setManualPreferredAccount,
+    syncAccountToCodexApp,
     deleteUnavailableFreeAccounts,
     exportAccountsByFile,
   };
 }
-

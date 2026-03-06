@@ -45,6 +45,7 @@ function renderAccountsOnlyNow(handlers) {
     onUpdateSort: handlers.onUpdateSort,
     onOpenUsage: handlers.onOpenUsage,
     onSetCurrentAccount: handlers.onSetCurrentAccount,
+    onSyncCodexApp: handlers.onSyncCodexApp,
     onDelete: handlers.onDeleteAccount,
   });
 }

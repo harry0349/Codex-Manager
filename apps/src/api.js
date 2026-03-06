@@ -331,6 +331,27 @@ export async function localAccountDelete(accountId) {
   return invoke("local_account_delete", { accountId });
 }
 
+export async function codexAppStatus() {
+  if (!isTauriRuntime()) {
+    return {
+      supported: false,
+      installed: false,
+      running: false,
+      localService: false,
+      authFileExists: false,
+      reason: "浏览器模式不支持同步到 Codex App",
+    };
+  }
+  return invoke("codex_app_status", withAddr());
+}
+
+export async function codexAppSyncAccount(accountId) {
+  if (!isTauriRuntime()) {
+    throw new Error("浏览器模式不支持同步到 Codex App");
+  }
+  return invoke("codex_app_sync_account", withAddr({ accountId }));
+}
+
 // 用量
 export async function serviceUsageRead(accountId) {
   if (!isTauriRuntime()) {
@@ -649,5 +670,4 @@ export async function updateStatus() {
   }
   return invokeFirst(["app_update_status", "update_status"], {});
 }
-
 

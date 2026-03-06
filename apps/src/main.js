@@ -1781,6 +1781,7 @@ const {
   handleClearRequestLogs,
   updateAccountSort,
   setManualPreferredAccount,
+  syncAccountToCodexApp,
   deleteAccount,
   importAccountsFromFiles,
   importAccountsFromDirectory,
@@ -1801,6 +1802,7 @@ function buildMainRenderActions() {
     updateAccountSort,
     handleOpenUsageModal,
     setManualPreferredAccount,
+    syncAccountToCodexApp,
     deleteAccount,
     toggleApiKeyStatus,
     deleteApiKey,
@@ -1963,7 +1965,6 @@ function bootstrap() {
 }
 
 window.addEventListener("DOMContentLoaded", bootstrap);
-
 
 
 

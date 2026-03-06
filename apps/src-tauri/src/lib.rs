@@ -1,18 +1,21 @@
+use codexmanager_core::auth::extract_chatgpt_account_id;
 use codexmanager_core::rpc::types::JsonRpcRequest;
 use codexmanager_core::storage::Storage;
 use rfd::FileDialog;
+use serde::Serialize;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::thread;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::thread;
 use std::time::Duration;
-use tauri::Manager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::Manager;
 
 mod updater;
 
@@ -21,39 +24,87 @@ const TRAY_MENU_QUIT_APP: &str = "tray_quit_app";
 static APP_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static TRAY_AVAILABLE: AtomicBool = AtomicBool::new(false);
 static CLOSE_TO_TRAY_ON_CLOSE: AtomicBool = AtomicBool::new(false);
+const CODEX_APP_BUNDLE_ID: &str = "com.openai.codex";
+const CODEX_APP_PATH: &str = "/Applications/Codex.app";
+const CODEX_APP_EXECUTABLE_PATH: &str = "/Applications/Codex.app/Contents/MacOS/Codex";
+const CODEX_CLI_PATH: &str = "/Applications/Codex.app/Contents/Resources/codex";
+const CODEX_AUTH_DIR_NAME: &str = ".codex";
+const CODEX_AUTH_FILE_NAME: &str = "auth.json";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppStatusResult {
+    supported: bool,
+    installed: bool,
+    running: bool,
+    local_service: bool,
+    auth_file_exists: bool,
+    app_path: Option<String>,
+    auth_file_path: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppSyncResult {
+    ok: bool,
+    running_before_sync: bool,
+    launched: bool,
+    auth_file_path: String,
+    chatgpt_account_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexAuthFilePayload {
+    auth_mode: String,
+    #[serde(rename = "OPENAI_API_KEY")]
+    openai_api_key: Option<String>,
+    tokens: CodexAuthTokensPayload,
+    last_refresh: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CodexAuthTokensPayload {
+    access_token: String,
+    id_token: String,
+    refresh_token: String,
+    account_id: String,
+}
 
 #[tauri::command]
 async fn service_initialize(addr: Option<String>) -> Result<serde_json::Value, String> {
-  let v = tauri::async_runtime::spawn_blocking(move || rpc_call("initialize", addr, None))
-    .await
-    .map_err(|err| format!("initialize task failed: {err}"))??;
-  // 连接探测必须确认对端确实是 codexmanager-service，避免端口被其他服务占用时误判“已连接”。
-  let server_name = v
-    .get("result")
-    .and_then(|r| r.get("server_name"))
-    .and_then(|s| s.as_str())
-    .unwrap_or("");
-  if server_name != "codexmanager-service" {
-    let hint = if server_name.is_empty() {
-      "missing server_name"
-    } else {
-      server_name
-    };
-    return Err(format!("Port is in use or unexpected service responded ({hint})"));
-  }
-  Ok(v)
+    let v = tauri::async_runtime::spawn_blocking(move || rpc_call("initialize", addr, None))
+        .await
+        .map_err(|err| format!("initialize task failed: {err}"))??;
+    // 连接探测必须确认对端确实是 codexmanager-service，避免端口被其他服务占用时误判“已连接”。
+    let server_name = v
+        .get("result")
+        .and_then(|r| r.get("server_name"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    if server_name != "codexmanager-service" {
+        let hint = if server_name.is_empty() {
+            "missing server_name"
+        } else {
+            server_name
+        };
+        return Err(format!(
+            "Port is in use or unexpected service responded ({hint})"
+        ));
+    }
+    Ok(v)
 }
 
 async fn rpc_call_in_background(
-  method: &'static str,
-  addr: Option<String>,
-  params: Option<serde_json::Value>,
+    method: &'static str,
+    addr: Option<String>,
+    params: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-  let method_name = method.to_string();
-  let method_for_task = method_name.clone();
-  tauri::async_runtime::spawn_blocking(move || rpc_call(&method_for_task, addr, params))
-    .await
-    .map_err(|err| format!("{method_name} task failed: {err}"))?
+    let method_name = method.to_string();
+    let method_for_task = method_name.clone();
+    tauri::async_runtime::spawn_blocking(move || rpc_call(&method_for_task, addr, params))
+        .await
+        .map_err(|err| format!("{method_name} task failed: {err}"))?
 }
 
 fn collect_json_files_recursively(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -99,79 +150,97 @@ fn read_account_import_contents_from_directory(
 
 #[tauri::command]
 async fn service_start(app: tauri::AppHandle, addr: String) -> Result<(), String> {
-  let addr = normalize_addr(&addr)?;
-  tauri::async_runtime::spawn_blocking(move || {
-    log::info!("service_start requested addr={}", addr);
-    // 中文注释：保存地址与回调地址，按需启动 service
-    std::env::set_var("CODEXMANAGER_SERVICE_ADDR", &addr);
-    stop_service();
-    spawn_service_with_addr(&app, &addr)?;
-    wait_for_service_ready(&addr, 12, Duration::from_millis(250)).map_err(|err| {
-      log::error!("service health check failed at {}: {}", addr, err);
-      stop_service();
-      format!("service not ready at {addr}: {err}")
+    let addr = normalize_addr(&addr)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        log::info!("service_start requested addr={}", addr);
+        // 中文注释：保存地址与回调地址，按需启动 service
+        std::env::set_var("CODEXMANAGER_SERVICE_ADDR", &addr);
+        stop_service();
+        spawn_service_with_addr(&app, &addr)?;
+        wait_for_service_ready(&addr, 12, Duration::from_millis(250)).map_err(|err| {
+            log::error!("service health check failed at {}: {}", addr, err);
+            stop_service();
+            format!("service not ready at {addr}: {err}")
+        })
     })
-  })
-  .await
-  .map_err(|err| format!("service_start task failed: {err}"))?
+    .await
+    .map_err(|err| format!("service_start task failed: {err}"))?
 }
 
 #[tauri::command]
 async fn service_stop() -> Result<(), String> {
-  tauri::async_runtime::spawn_blocking(move || {
-    // 中文注释：显式停止 service 进程
-    stop_service();
-    Ok(())
-  })
-  .await
-  .map_err(|err| format!("service_stop task failed: {err}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        // 中文注释：显式停止 service 进程
+        stop_service();
+        Ok(())
+    })
+    .await
+    .map_err(|err| format!("service_stop task failed: {err}"))?
 }
 
 #[tauri::command]
 async fn service_account_list(addr: Option<String>) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("account/list", addr, None).await
+    rpc_call_in_background("account/list", addr, None).await
+}
+
+#[tauri::command]
+async fn codex_app_status(addr: Option<String>) -> Result<CodexAppStatusResult, String> {
+    tauri::async_runtime::spawn_blocking(move || build_codex_app_status(addr.as_deref()))
+        .await
+        .map_err(|err| format!("codex_app_status task failed: {err}"))?
+}
+
+#[tauri::command]
+async fn codex_app_sync_account(
+    app: tauri::AppHandle,
+    addr: Option<String>,
+    account_id: String,
+) -> Result<CodexAppSyncResult, String> {
+    tauri::async_runtime::spawn_blocking(move || sync_account_to_codex_app(&app, addr, &account_id))
+        .await
+        .map_err(|err| format!("codex_app_sync_account task failed: {err}"))?
 }
 
 #[tauri::command]
 async fn service_account_delete(
-  addr: Option<String>,
-  account_id: String,
+    addr: Option<String>,
+    account_id: String,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "accountId": account_id });
-  rpc_call_in_background("account/delete", addr, Some(params)).await
+    let params = serde_json::json!({ "accountId": account_id });
+    rpc_call_in_background("account/delete", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_account_delete_unavailable_free(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("account/deleteUnavailableFree", addr, None).await
+    rpc_call_in_background("account/deleteUnavailableFree", addr, None).await
 }
 
 #[tauri::command]
 async fn service_account_update(
-  addr: Option<String>,
-  account_id: String,
-  sort: i64,
+    addr: Option<String>,
+    account_id: String,
+    sort: i64,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "accountId": account_id, "sort": sort });
-  rpc_call_in_background("account/update", addr, Some(params)).await
+    let params = serde_json::json!({ "accountId": account_id, "sort": sort });
+    rpc_call_in_background("account/update", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_account_import(
-  addr: Option<String>,
-  contents: Option<Vec<String>>,
-  content: Option<String>,
+    addr: Option<String>,
+    contents: Option<Vec<String>>,
+    content: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let mut payload_contents = contents.unwrap_or_default();
-  if let Some(single) = content {
-    if !single.trim().is_empty() {
-      payload_contents.push(single);
+    let mut payload_contents = contents.unwrap_or_default();
+    if let Some(single) = content {
+        if !single.trim().is_empty() {
+            payload_contents.push(single);
+        }
     }
-  }
-  let params = serde_json::json!({ "contents": payload_contents });
-  rpc_call_in_background("account/import", addr, Some(params)).await
+    let params = serde_json::json!({ "contents": payload_contents });
+    rpc_call_in_background("account/import", addr, Some(params)).await
 }
 
 #[tauri::command]
@@ -208,1055 +277,1413 @@ async fn service_account_import_by_directory(
 
 #[tauri::command]
 async fn service_account_export_by_account_files(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  tauri::async_runtime::spawn_blocking(move || {
-    let selected_dir = FileDialog::new()
-      .set_title("选择账号导出目录")
-      .pick_folder();
-    let Some(dir_path) = selected_dir else {
-      return Ok(serde_json::json!({
-        "result": {
-          "ok": true,
-          "canceled": true
-        }
-      }));
-    };
-    let params = serde_json::json!({
-      "outputDir": dir_path.to_string_lossy().to_string()
-    });
-    rpc_call("account/export", addr, Some(params))
-  })
-  .await
-  .map_err(|err| format!("service_account_export_by_account_files task failed: {err}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let selected_dir = FileDialog::new()
+            .set_title("选择账号导出目录")
+            .pick_folder();
+        let Some(dir_path) = selected_dir else {
+            return Ok(serde_json::json!({
+              "result": {
+                "ok": true,
+                "canceled": true
+              }
+            }));
+        };
+        let params = serde_json::json!({
+          "outputDir": dir_path.to_string_lossy().to_string()
+        });
+        rpc_call("account/export", addr, Some(params))
+    })
+    .await
+    .map_err(|err| format!("service_account_export_by_account_files task failed: {err}"))?
 }
 
 #[tauri::command]
 async fn local_account_delete(
-  app: tauri::AppHandle,
-  account_id: String,
+    app: tauri::AppHandle,
+    account_id: String,
 ) -> Result<serde_json::Value, String> {
-  let db_path = resolve_db_path_with_legacy_migration(&app)?;
-  tauri::async_runtime::spawn_blocking(move || {
-    let mut storage = Storage::open(db_path).map_err(|e| e.to_string())?;
-    storage
-      .delete_account(&account_id)
-      .map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "ok": true }))
-  })
-  .await
-  .map_err(|err| format!("local_account_delete task failed: {err}"))?
+    let db_path = resolve_db_path_with_legacy_migration(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut storage = Storage::open(db_path).map_err(|e| e.to_string())?;
+        storage
+            .delete_account(&account_id)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "ok": true }))
+    })
+    .await
+    .map_err(|err| format!("local_account_delete task failed: {err}"))?
 }
 
 #[tauri::command]
 async fn service_usage_read(
-  addr: Option<String>,
-  account_id: Option<String>,
+    addr: Option<String>,
+    account_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let params = account_id.map(|id| serde_json::json!({ "accountId": id }));
-  rpc_call_in_background("account/usage/read", addr, params).await
+    let params = account_id.map(|id| serde_json::json!({ "accountId": id }));
+    rpc_call_in_background("account/usage/read", addr, params).await
 }
 
 #[tauri::command]
 async fn service_usage_list(addr: Option<String>) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("account/usage/list", addr, None).await
+    rpc_call_in_background("account/usage/list", addr, None).await
 }
 
 #[tauri::command]
 async fn service_usage_refresh(
-  addr: Option<String>,
-  account_id: Option<String>,
+    addr: Option<String>,
+    account_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let params = account_id.map(|id| serde_json::json!({ "accountId": id }));
-  rpc_call_in_background("account/usage/refresh", addr, params).await
+    let params = account_id.map(|id| serde_json::json!({ "accountId": id }));
+    rpc_call_in_background("account/usage/refresh", addr, params).await
 }
 
 #[tauri::command]
 async fn service_requestlog_list(
-  addr: Option<String>,
-  query: Option<String>,
-  limit: Option<i64>,
+    addr: Option<String>,
+    query: Option<String>,
+    limit: Option<i64>,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "query": query, "limit": limit });
-  rpc_call_in_background("requestlog/list", addr, Some(params)).await
+    let params = serde_json::json!({ "query": query, "limit": limit });
+    rpc_call_in_background("requestlog/list", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_rpc_token() -> Result<String, String> {
-  Ok(codexmanager_service::rpc_auth_token().to_string())
+    Ok(codexmanager_service::rpc_auth_token().to_string())
 }
 
 #[tauri::command]
 async fn service_requestlog_clear(addr: Option<String>) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("requestlog/clear", addr, None).await
+    rpc_call_in_background("requestlog/clear", addr, None).await
 }
 
 #[tauri::command]
-async fn service_requestlog_today_summary(addr: Option<String>) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("requestlog/today_summary", addr, None).await
+async fn service_requestlog_today_summary(
+    addr: Option<String>,
+) -> Result<serde_json::Value, String> {
+    rpc_call_in_background("requestlog/today_summary", addr, None).await
 }
 
 #[tauri::command]
 async fn service_gateway_route_strategy_get(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("gateway/routeStrategy/get", addr, None).await
+    rpc_call_in_background("gateway/routeStrategy/get", addr, None).await
 }
 
 #[tauri::command]
 async fn service_gateway_route_strategy_set(
-  addr: Option<String>,
-  strategy: String,
+    addr: Option<String>,
+    strategy: String,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "strategy": strategy });
-  rpc_call_in_background("gateway/routeStrategy/set", addr, Some(params)).await
+    let params = serde_json::json!({ "strategy": strategy });
+    rpc_call_in_background("gateway/routeStrategy/set", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_gateway_manual_account_get(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("gateway/manualAccount/get", addr, None).await
+    rpc_call_in_background("gateway/manualAccount/get", addr, None).await
 }
 
 #[tauri::command]
 async fn service_gateway_manual_account_set(
-  addr: Option<String>,
-  account_id: String,
+    addr: Option<String>,
+    account_id: String,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "accountId": account_id });
-  rpc_call_in_background("gateway/manualAccount/set", addr, Some(params)).await
+    let params = serde_json::json!({ "accountId": account_id });
+    rpc_call_in_background("gateway/manualAccount/set", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_gateway_manual_account_clear(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("gateway/manualAccount/clear", addr, None).await
+    rpc_call_in_background("gateway/manualAccount/clear", addr, None).await
 }
 
 #[tauri::command]
 async fn service_gateway_header_policy_get(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("gateway/headerPolicy/get", addr, None).await
+    rpc_call_in_background("gateway/headerPolicy/get", addr, None).await
 }
 
 #[tauri::command]
 async fn service_gateway_header_policy_set(
-  addr: Option<String>,
-  cpa_no_cookie_header_mode_enabled: bool,
+    addr: Option<String>,
+    cpa_no_cookie_header_mode_enabled: bool,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "cpaNoCookieHeaderModeEnabled": cpa_no_cookie_header_mode_enabled });
-  rpc_call_in_background("gateway/headerPolicy/set", addr, Some(params)).await
+    let params =
+        serde_json::json!({ "cpaNoCookieHeaderModeEnabled": cpa_no_cookie_header_mode_enabled });
+    rpc_call_in_background("gateway/headerPolicy/set", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_gateway_background_tasks_get(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("gateway/backgroundTasks/get", addr, None).await
+    rpc_call_in_background("gateway/backgroundTasks/get", addr, None).await
 }
 
 #[tauri::command]
 async fn service_gateway_background_tasks_set(
-  addr: Option<String>,
-  usage_polling_enabled: Option<bool>,
-  usage_poll_interval_secs: Option<u64>,
-  gateway_keepalive_enabled: Option<bool>,
-  gateway_keepalive_interval_secs: Option<u64>,
-  token_refresh_polling_enabled: Option<bool>,
-  token_refresh_poll_interval_secs: Option<u64>,
-  usage_refresh_workers: Option<u64>,
-  http_worker_factor: Option<u64>,
-  http_worker_min: Option<u64>,
-  http_stream_worker_factor: Option<u64>,
-  http_stream_worker_min: Option<u64>,
+    addr: Option<String>,
+    usage_polling_enabled: Option<bool>,
+    usage_poll_interval_secs: Option<u64>,
+    gateway_keepalive_enabled: Option<bool>,
+    gateway_keepalive_interval_secs: Option<u64>,
+    token_refresh_polling_enabled: Option<bool>,
+    token_refresh_poll_interval_secs: Option<u64>,
+    usage_refresh_workers: Option<u64>,
+    http_worker_factor: Option<u64>,
+    http_worker_min: Option<u64>,
+    http_stream_worker_factor: Option<u64>,
+    http_stream_worker_min: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({
-    "usagePollingEnabled": usage_polling_enabled,
-    "usagePollIntervalSecs": usage_poll_interval_secs,
-    "gatewayKeepaliveEnabled": gateway_keepalive_enabled,
-    "gatewayKeepaliveIntervalSecs": gateway_keepalive_interval_secs,
-    "tokenRefreshPollingEnabled": token_refresh_polling_enabled,
-    "tokenRefreshPollIntervalSecs": token_refresh_poll_interval_secs,
-    "usageRefreshWorkers": usage_refresh_workers,
-    "httpWorkerFactor": http_worker_factor,
-    "httpWorkerMin": http_worker_min,
-    "httpStreamWorkerFactor": http_stream_worker_factor,
-    "httpStreamWorkerMin": http_stream_worker_min
-  });
-  rpc_call_in_background("gateway/backgroundTasks/set", addr, Some(params)).await
+    let params = serde_json::json!({
+      "usagePollingEnabled": usage_polling_enabled,
+      "usagePollIntervalSecs": usage_poll_interval_secs,
+      "gatewayKeepaliveEnabled": gateway_keepalive_enabled,
+      "gatewayKeepaliveIntervalSecs": gateway_keepalive_interval_secs,
+      "tokenRefreshPollingEnabled": token_refresh_polling_enabled,
+      "tokenRefreshPollIntervalSecs": token_refresh_poll_interval_secs,
+      "usageRefreshWorkers": usage_refresh_workers,
+      "httpWorkerFactor": http_worker_factor,
+      "httpWorkerMin": http_worker_min,
+      "httpStreamWorkerFactor": http_stream_worker_factor,
+      "httpStreamWorkerMin": http_stream_worker_min
+    });
+    rpc_call_in_background("gateway/backgroundTasks/set", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_gateway_upstream_proxy_get(
-  addr: Option<String>,
+    addr: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("gateway/upstreamProxy/get", addr, None).await
+    rpc_call_in_background("gateway/upstreamProxy/get", addr, None).await
 }
 
 #[tauri::command]
 async fn service_gateway_upstream_proxy_set(
-  addr: Option<String>,
-  proxy_url: Option<String>,
+    addr: Option<String>,
+    proxy_url: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "proxyUrl": proxy_url });
-  rpc_call_in_background("gateway/upstreamProxy/set", addr, Some(params)).await
+    let params = serde_json::json!({ "proxyUrl": proxy_url });
+    rpc_call_in_background("gateway/upstreamProxy/set", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_login_start(
-  addr: Option<String>,
-  login_type: String,
-  open_browser: Option<bool>,
-  note: Option<String>,
-  tags: Option<String>,
-  group_name: Option<String>,
-  workspace_id: Option<String>,
+    addr: Option<String>,
+    login_type: String,
+    open_browser: Option<bool>,
+    note: Option<String>,
+    tags: Option<String>,
+    group_name: Option<String>,
+    workspace_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({
-    "type": login_type,
-    "openBrowser": open_browser.unwrap_or(true),
-    "note": note,
-    "tags": tags,
-    "groupName": group_name,
-    "workspaceId": workspace_id
-  });
-  rpc_call_in_background("account/login/start", addr, Some(params)).await
+    let params = serde_json::json!({
+      "type": login_type,
+      "openBrowser": open_browser.unwrap_or(true),
+      "note": note,
+      "tags": tags,
+      "groupName": group_name,
+      "workspaceId": workspace_id
+    });
+    rpc_call_in_background("account/login/start", addr, Some(params)).await
 }
 
 #[tauri::command]
-async fn service_login_status(addr: Option<String>, login_id: String) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({
-    "loginId": login_id
-  });
-  rpc_call_in_background("account/login/status", addr, Some(params)).await
+async fn service_login_status(
+    addr: Option<String>,
+    login_id: String,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+      "loginId": login_id
+    });
+    rpc_call_in_background("account/login/status", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_login_complete(
-  addr: Option<String>,
-  state: String,
-  code: String,
-  redirect_uri: Option<String>,
+    addr: Option<String>,
+    state: String,
+    code: String,
+    redirect_uri: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({
-    "state": state,
-    "code": code,
-    "redirectUri": redirect_uri
-  });
-  rpc_call_in_background("account/login/complete", addr, Some(params)).await
+    let params = serde_json::json!({
+      "state": state,
+      "code": code,
+      "redirectUri": redirect_uri
+    });
+    rpc_call_in_background("account/login/complete", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_apikey_list(addr: Option<String>) -> Result<serde_json::Value, String> {
-  rpc_call_in_background("apikey/list", addr, None).await
+    rpc_call_in_background("apikey/list", addr, None).await
 }
 
 #[tauri::command]
 async fn service_apikey_read_secret(
-  addr: Option<String>,
-  key_id: String,
+    addr: Option<String>,
+    key_id: String,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "id": key_id });
-  rpc_call_in_background("apikey/readSecret", addr, Some(params)).await
+    let params = serde_json::json!({ "id": key_id });
+    rpc_call_in_background("apikey/readSecret", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_apikey_create(
-  addr: Option<String>,
-  name: Option<String>,
-  model_slug: Option<String>,
-  reasoning_effort: Option<String>,
-  protocol_type: Option<String>,
-  upstream_base_url: Option<String>,
-  static_headers_json: Option<String>,
+    addr: Option<String>,
+    name: Option<String>,
+    model_slug: Option<String>,
+    reasoning_effort: Option<String>,
+    protocol_type: Option<String>,
+    upstream_base_url: Option<String>,
+    static_headers_json: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({
-    "name": name,
-    "modelSlug": model_slug,
-    "reasoningEffort": reasoning_effort,
-    "protocolType": protocol_type,
-    "upstreamBaseUrl": upstream_base_url,
-    "staticHeadersJson": static_headers_json,
-  });
-  rpc_call_in_background("apikey/create", addr, Some(params)).await
+    let params = serde_json::json!({
+      "name": name,
+      "modelSlug": model_slug,
+      "reasoningEffort": reasoning_effort,
+      "protocolType": protocol_type,
+      "upstreamBaseUrl": upstream_base_url,
+      "staticHeadersJson": static_headers_json,
+    });
+    rpc_call_in_background("apikey/create", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn service_apikey_models(
-  addr: Option<String>,
-  refresh_remote: Option<bool>,
+    addr: Option<String>,
+    refresh_remote: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-  let params = refresh_remote.map(|value| serde_json::json!({ "refreshRemote": value }));
-  rpc_call_in_background("apikey/models", addr, params).await
+    let params = refresh_remote.map(|value| serde_json::json!({ "refreshRemote": value }));
+    rpc_call_in_background("apikey/models", addr, params).await
 }
 
 #[tauri::command]
 async fn service_apikey_update_model(
-  addr: Option<String>,
-  key_id: String,
-  model_slug: Option<String>,
-  reasoning_effort: Option<String>,
-  protocol_type: Option<String>,
-  upstream_base_url: Option<String>,
-  static_headers_json: Option<String>,
+    addr: Option<String>,
+    key_id: String,
+    model_slug: Option<String>,
+    reasoning_effort: Option<String>,
+    protocol_type: Option<String>,
+    upstream_base_url: Option<String>,
+    static_headers_json: Option<String>,
 ) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({
-    "id": key_id,
-    "modelSlug": model_slug,
-    "reasoningEffort": reasoning_effort,
-    "protocolType": protocol_type,
-    "upstreamBaseUrl": upstream_base_url,
-    "staticHeadersJson": static_headers_json,
-  });
-  rpc_call_in_background("apikey/updateModel", addr, Some(params)).await
+    let params = serde_json::json!({
+      "id": key_id,
+      "modelSlug": model_slug,
+      "reasoningEffort": reasoning_effort,
+      "protocolType": protocol_type,
+      "upstreamBaseUrl": upstream_base_url,
+      "staticHeadersJson": static_headers_json,
+    });
+    rpc_call_in_background("apikey/updateModel", addr, Some(params)).await
 }
 
 #[tauri::command]
-async fn service_apikey_delete(addr: Option<String>, key_id: String) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "id": key_id });
-  rpc_call_in_background("apikey/delete", addr, Some(params)).await
+async fn service_apikey_delete(
+    addr: Option<String>,
+    key_id: String,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "id": key_id });
+    rpc_call_in_background("apikey/delete", addr, Some(params)).await
 }
 
 #[tauri::command]
-async fn service_apikey_disable(addr: Option<String>, key_id: String) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "id": key_id });
-  rpc_call_in_background("apikey/disable", addr, Some(params)).await
+async fn service_apikey_disable(
+    addr: Option<String>,
+    key_id: String,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "id": key_id });
+    rpc_call_in_background("apikey/disable", addr, Some(params)).await
 }
 
 #[tauri::command]
-async fn service_apikey_enable(addr: Option<String>, key_id: String) -> Result<serde_json::Value, String> {
-  let params = serde_json::json!({ "id": key_id });
-  rpc_call_in_background("apikey/enable", addr, Some(params)).await
+async fn service_apikey_enable(
+    addr: Option<String>,
+    key_id: String,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({ "id": key_id });
+    rpc_call_in_background("apikey/enable", addr, Some(params)).await
 }
 
 #[tauri::command]
 async fn open_in_browser(url: String) -> Result<(), String> {
-  tauri::async_runtime::spawn_blocking(move || {
-    open_in_browser_blocking(&url)
-  })
-  .await
-  .map_err(|err| format!("open_in_browser task failed: {err}"))?
+    tauri::async_runtime::spawn_blocking(move || open_in_browser_blocking(&url))
+        .await
+        .map_err(|err| format!("open_in_browser task failed: {err}"))?
 }
 
 #[tauri::command]
 fn app_close_to_tray_on_close_get() -> bool {
-  CLOSE_TO_TRAY_ON_CLOSE.load(Ordering::Relaxed) && TRAY_AVAILABLE.load(Ordering::Relaxed)
+    CLOSE_TO_TRAY_ON_CLOSE.load(Ordering::Relaxed) && TRAY_AVAILABLE.load(Ordering::Relaxed)
 }
 
 #[tauri::command]
 fn app_close_to_tray_on_close_set(enabled: bool) -> bool {
-  if enabled && !TRAY_AVAILABLE.load(Ordering::Relaxed) {
-    CLOSE_TO_TRAY_ON_CLOSE.store(false, Ordering::Relaxed);
-    return false;
-  }
-  CLOSE_TO_TRAY_ON_CLOSE.store(enabled, Ordering::Relaxed);
-  enabled
+    if enabled && !TRAY_AVAILABLE.load(Ordering::Relaxed) {
+        CLOSE_TO_TRAY_ON_CLOSE.store(false, Ordering::Relaxed);
+        return false;
+    }
+    CLOSE_TO_TRAY_ON_CLOSE.store(enabled, Ordering::Relaxed);
+    enabled
 }
 
 fn open_in_browser_blocking(url: &str) -> Result<(), String> {
-  if cfg!(target_os = "windows") {
-    let status = std::process::Command::new("rundll32.exe")
-      .args(["url.dll,FileProtocolHandler", url])
-      .status()
-      .map_err(|e| e.to_string())?;
-    if status.success() {
-      Ok(())
+    if cfg!(target_os = "windows") {
+        let status = std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("rundll32 failed with status: {status}"))
+        }
     } else {
-      Err(format!("rundll32 failed with status: {status}"))
+        webbrowser::open(url).map(|_| ()).map_err(|e| e.to_string())
     }
-  } else {
-    webbrowser::open(url).map(|_| ()).map_err(|e| e.to_string())
-  }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-  let app = tauri::Builder::default()
-    .setup(|app| {
-      load_env_from_exe_dir();
-      apply_runtime_storage_env(app.handle());
-      app.handle().plugin(
-        tauri_plugin_log::Builder::default()
-          .level(log::LevelFilter::Info)
-          .targets([
-            tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None }),
-          ])
-          .build(),
-      )?;
-      if let Ok(log_dir) = app.path().app_log_dir() {
-        log::info!("log dir: {}", log_dir.display());
-      }
-      // 中文注释：系统托盘只是增强能力，初始化失败时不能阻塞主窗口启动。
-      if let Err(err) = setup_tray(app.handle()) {
-        TRAY_AVAILABLE.store(false, Ordering::Relaxed);
-        CLOSE_TO_TRAY_ON_CLOSE.store(false, Ordering::Relaxed);
-        log::warn!("tray setup unavailable, continue without tray: {}", err);
-      }
+    let app = tauri::Builder::default()
+        .setup(|app| {
+            load_env_from_exe_dir();
+            apply_runtime_storage_env(app.handle());
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .targets([tauri_plugin_log::Target::new(
+                        tauri_plugin_log::TargetKind::LogDir { file_name: None },
+                    )])
+                    .build(),
+            )?;
+            if let Ok(log_dir) = app.path().app_log_dir() {
+                log::info!("log dir: {}", log_dir.display());
+            }
+            // 中文注释：系统托盘只是增强能力，初始化失败时不能阻塞主窗口启动。
+            if let Err(err) = setup_tray(app.handle()) {
+                TRAY_AVAILABLE.store(false, Ordering::Relaxed);
+                CLOSE_TO_TRAY_ON_CLOSE.store(false, Ordering::Relaxed);
+                log::warn!("tray setup unavailable, continue without tray: {}", err);
+            }
 
-      Ok(())
-    })
-    .on_window_event(|window, event| {
-      if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-        if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
-          return;
-        }
-        if !CLOSE_TO_TRAY_ON_CLOSE.load(Ordering::Relaxed) {
-          return;
-        }
-        if !TRAY_AVAILABLE.load(Ordering::Relaxed) {
-          CLOSE_TO_TRAY_ON_CLOSE.store(false, Ordering::Relaxed);
-          return;
-        }
-        api.prevent_close();
-        if let Err(err) = window.hide() {
-          log::warn!("hide window to tray failed: {}", err);
-        } else {
-          log::info!("window close intercepted; app hidden to tray");
-        }
-        return;
-      }
-      if let tauri::WindowEvent::Destroyed = event {
-        stop_service();
-      }
-    })
-    .invoke_handler(tauri::generate_handler![
-      service_start,
-      service_stop,
-      service_initialize,
-      service_account_list,
-      service_account_delete,
-      service_account_delete_unavailable_free,
-      service_account_update,
-      service_account_import,
-      service_account_import_by_directory,
-      service_account_export_by_account_files,
-      local_account_delete,
-      service_usage_read,
-      service_usage_list,
-      service_usage_refresh,
-      service_rpc_token,
-      service_requestlog_list,
-      service_requestlog_clear,
-      service_requestlog_today_summary,
-      service_gateway_route_strategy_get,
-      service_gateway_route_strategy_set,
-      service_gateway_manual_account_get,
-      service_gateway_manual_account_set,
-      service_gateway_manual_account_clear,
-      service_gateway_header_policy_get,
-      service_gateway_header_policy_set,
-      service_gateway_background_tasks_get,
-      service_gateway_background_tasks_set,
-      service_gateway_upstream_proxy_get,
-      service_gateway_upstream_proxy_set,
-      service_login_start,
-      service_login_status,
-      service_login_complete,
-      service_apikey_list,
-      service_apikey_read_secret,
-      service_apikey_create,
-      service_apikey_models,
-      service_apikey_update_model,
-      service_apikey_delete,
-      service_apikey_disable,
-      service_apikey_enable,
-      open_in_browser,
-      app_close_to_tray_on_close_get,
-      app_close_to_tray_on_close_set,
-      updater::app_update_check,
-      updater::app_update_prepare,
-      updater::app_update_apply_portable,
-      updater::app_update_launch_installer,
-      updater::app_update_status
-    ])
-    .build(tauri::generate_context!())
-    .expect("error while building tauri application");
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if APP_EXIT_REQUESTED.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !CLOSE_TO_TRAY_ON_CLOSE.load(Ordering::Relaxed) {
+                    return;
+                }
+                if !TRAY_AVAILABLE.load(Ordering::Relaxed) {
+                    CLOSE_TO_TRAY_ON_CLOSE.store(false, Ordering::Relaxed);
+                    return;
+                }
+                api.prevent_close();
+                if let Err(err) = window.hide() {
+                    log::warn!("hide window to tray failed: {}", err);
+                } else {
+                    log::info!("window close intercepted; app hidden to tray");
+                }
+                return;
+            }
+            if let tauri::WindowEvent::Destroyed = event {
+                stop_service();
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            service_start,
+            service_stop,
+            service_initialize,
+            codex_app_status,
+            codex_app_sync_account,
+            service_account_list,
+            service_account_delete,
+            service_account_delete_unavailable_free,
+            service_account_update,
+            service_account_import,
+            service_account_export_by_account_files,
+            local_account_delete,
+            service_usage_read,
+            service_usage_list,
+            service_usage_refresh,
+            service_rpc_token,
+            service_requestlog_list,
+            service_requestlog_clear,
+            service_requestlog_today_summary,
+            service_gateway_route_strategy_get,
+            service_gateway_route_strategy_set,
+            service_gateway_manual_account_get,
+            service_gateway_manual_account_set,
+            service_gateway_manual_account_clear,
+            service_gateway_header_policy_get,
+            service_gateway_header_policy_set,
+            service_gateway_background_tasks_get,
+            service_gateway_background_tasks_set,
+            service_gateway_upstream_proxy_get,
+            service_gateway_upstream_proxy_set,
+            service_login_start,
+            service_login_status,
+            service_login_complete,
+            service_apikey_list,
+            service_apikey_read_secret,
+            service_apikey_create,
+            service_apikey_models,
+            service_apikey_update_model,
+            service_apikey_delete,
+            service_apikey_disable,
+            service_apikey_enable,
+            open_in_browser,
+            app_close_to_tray_on_close_get,
+            app_close_to_tray_on_close_set,
+            updater::app_update_check,
+            updater::app_update_prepare,
+            updater::app_update_apply_portable,
+            updater::app_update_launch_installer,
+            updater::app_update_status
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
 
-  app.run(|_app_handle, event| match event {
-    tauri::RunEvent::ExitRequested { .. } => {
-      APP_EXIT_REQUESTED.store(true, Ordering::Relaxed);
-      stop_service();
-    }
-    #[cfg(target_os = "macos")]
-    tauri::RunEvent::Reopen { .. } => {
-      show_main_window(_app_handle);
-    }
-    _ => {}
-  });
+    app.run(|_app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { .. } => {
+            APP_EXIT_REQUESTED.store(true, Ordering::Relaxed);
+            stop_service();
+        }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {
+            show_main_window(_app_handle);
+        }
+        _ => {}
+    });
 }
 
 fn setup_tray(app: &tauri::AppHandle) -> Result<(), tauri::Error> {
-  TRAY_AVAILABLE.store(false, Ordering::Relaxed);
-  let show_main = MenuItem::with_id(app, TRAY_MENU_SHOW_MAIN, "显示主窗口", true, None::<&str>)?;
-  let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_APP, "退出", true, None::<&str>)?;
-  let menu = Menu::with_items(app, &[&show_main, &quit])?;
-  let mut tray = TrayIconBuilder::with_id("main-tray")
-    .menu(&menu)
-    .show_menu_on_left_click(false)
-    .on_menu_event(|app, event| match event.id().as_ref() {
-      TRAY_MENU_SHOW_MAIN => {
-        show_main_window(app);
-      }
-      TRAY_MENU_QUIT_APP => {
-        APP_EXIT_REQUESTED.store(true, Ordering::Relaxed);
-        stop_service();
-        app.exit(0);
-      }
-      _ => {}
-    })
-    .on_tray_icon_event(|tray, event| {
-      if let TrayIconEvent::Click {
-        button: MouseButton::Left,
-        button_state: MouseButtonState::Up,
-        ..
-      } = event
-      {
-        show_main_window(&tray.app_handle());
-      }
-    });
-  if let Some(icon) = app.default_window_icon() {
-    tray = tray.icon(icon.clone());
-  }
-  tray.build(app)?;
-  TRAY_AVAILABLE.store(true, Ordering::Relaxed);
-  Ok(())
+    TRAY_AVAILABLE.store(false, Ordering::Relaxed);
+    let show_main = MenuItem::with_id(app, TRAY_MENU_SHOW_MAIN, "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, TRAY_MENU_QUIT_APP, "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show_main, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("main-tray")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            TRAY_MENU_SHOW_MAIN => {
+                show_main_window(app);
+            }
+            TRAY_MENU_QUIT_APP => {
+                APP_EXIT_REQUESTED.store(true, Ordering::Relaxed);
+                stop_service();
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(&tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    TRAY_AVAILABLE.store(true, Ordering::Relaxed);
+    Ok(())
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
-  let Some(window) = app.get_webview_window("main") else {
-    return;
-  };
-  if let Err(err) = window.show() {
-    log::warn!("show main window failed: {}", err);
-    return;
-  }
-  let _ = window.unminimize();
-  let _ = window.set_focus();
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if let Err(err) = window.show() {
+        log::warn!("show main window failed: {}", err);
+        return;
+    }
+    let _ = window.unminimize();
+    let _ = window.set_focus();
 }
 
 fn load_env_from_exe_dir() {
-  let exe_path = match std::env::current_exe() {
-    Ok(p) => p,
-    Err(err) => {
-      log::warn!("Failed to resolve current exe path: {}", err);
-      return;
-    }
-  };
-  let Some(exe_dir) = exe_path.parent() else {
-    return;
-  };
-
-  // Portable-friendly env injection: if a file exists next to the exe, load KEY=VALUE pairs
-  // into process environment so the embedded service (gateway) can read them.
-  //
-  // This avoids relying on global/system env vars when distributing a portable folder.
-  // File names (first match wins): codexmanager.env, CodexManager.env, .env
-  let candidates = ["codexmanager.env", "CodexManager.env", ".env"];
-  let mut chosen = None;
-  for name in candidates {
-    let p = exe_dir.join(name);
-    if p.is_file() {
-      chosen = Some(p);
-      break;
-    }
-  }
-  let Some(path) = chosen else {
-    return;
-  };
-
-  let bytes = match std::fs::read(&path) {
-    Ok(v) => v,
-    Err(err) => {
-      log::warn!("Failed to read env file {}: {}", path.display(), err);
-      return;
-    }
-  };
-  let content = String::from_utf8_lossy(&bytes);
-  let mut applied = 0usize;
-  for (idx, raw_line) in content.lines().enumerate() {
-    let line_no = idx + 1;
-    let line = raw_line.trim();
-    if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
-      continue;
-    }
-    let Some((key_raw, value_raw)) = line.split_once('=') else {
-      log::warn!(
-        "Skip invalid env line {}:{} (missing '=')",
-        path.display(),
-        line_no
-      );
-      continue;
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(err) => {
+            log::warn!("Failed to resolve current exe path: {}", err);
+            return;
+        }
     };
-    let key = key_raw.trim();
-    if key.is_empty() {
-      continue;
+    let Some(exe_dir) = exe_path.parent() else {
+        return;
+    };
+
+    // Portable-friendly env injection: if a file exists next to the exe, load KEY=VALUE pairs
+    // into process environment so the embedded service (gateway) can read them.
+    //
+    // This avoids relying on global/system env vars when distributing a portable folder.
+    // File names (first match wins): codexmanager.env, CodexManager.env, .env
+    let candidates = ["codexmanager.env", "CodexManager.env", ".env"];
+    let mut chosen = None;
+    for name in candidates {
+        let p = exe_dir.join(name);
+        if p.is_file() {
+            chosen = Some(p);
+            break;
+        }
     }
-    let mut value = value_raw.trim().to_string();
-    if (value.starts_with('\"') && value.ends_with('\"') && value.len() >= 2)
-      || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
-    {
-      value = value[1..value.len() - 1].to_string();
+    let Some(path) = chosen else {
+        return;
+    };
+
+    let bytes = match std::fs::read(&path) {
+        Ok(v) => v,
+        Err(err) => {
+            log::warn!("Failed to read env file {}: {}", path.display(), err);
+            return;
+        }
+    };
+    let content = String::from_utf8_lossy(&bytes);
+    let mut applied = 0usize;
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key_raw, value_raw)) = line.split_once('=') else {
+            log::warn!(
+                "Skip invalid env line {}:{} (missing '=')",
+                path.display(),
+                line_no
+            );
+            continue;
+        };
+        let key = key_raw.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let mut value = value_raw.trim().to_string();
+        if (value.starts_with('\"') && value.ends_with('\"') && value.len() >= 2)
+            || (value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2)
+        {
+            value = value[1..value.len() - 1].to_string();
+        }
+
+        // Do not override already-defined env vars (system/user-level wins).
+        if std::env::var_os(key).is_some() {
+            continue;
+        }
+        std::env::set_var(key, value);
+        applied += 1;
     }
 
-    // Do not override already-defined env vars (system/user-level wins).
-    if std::env::var_os(key).is_some() {
-      continue;
+    if applied > 0 {
+        log::info!("Loaded {} env vars from {}", applied, path.display());
     }
-    std::env::set_var(key, value);
-    applied += 1;
-  }
-
-  if applied > 0 {
-    log::info!("Loaded {} env vars from {}", applied, path.display());
-  }
 }
 
 fn spawn_service_with_addr(app: &tauri::AppHandle, addr: &str) -> Result<(), String> {
-  if std::env::var("CODEXMANAGER_NO_SERVICE").is_ok() {
-    return Ok(());
-  }
-
-  apply_runtime_storage_env(app);
-
-  std::env::set_var("CODEXMANAGER_SERVICE_ADDR", addr);
-  codexmanager_service::clear_shutdown_flag();
-
-  let addr = addr.to_string();
-  let thread_addr = addr.clone();
-  log::info!("service starting at {}", addr);
-  let handle = thread::spawn(move || {
-    if let Err(err) = codexmanager_service::start_server(&thread_addr) {
-      log::error!("service stopped: {}", err);
+    if std::env::var("CODEXMANAGER_NO_SERVICE").is_ok() {
+        return Ok(());
     }
-  });
-  set_service_runtime(ServiceRuntime { addr, join: handle });
-  Ok(())
+
+    apply_runtime_storage_env(app);
+
+    std::env::set_var("CODEXMANAGER_SERVICE_ADDR", addr);
+    codexmanager_service::clear_shutdown_flag();
+
+    let addr = addr.to_string();
+    let thread_addr = addr.clone();
+    log::info!("service starting at {}", addr);
+    let handle = thread::spawn(move || {
+        if let Err(err) = codexmanager_service::start_server(&thread_addr) {
+            log::error!("service stopped: {}", err);
+        }
+    });
+    set_service_runtime(ServiceRuntime { addr, join: handle });
+    Ok(())
 }
 
 fn resolve_rpc_token_path_for_db(db_path: &Path) -> PathBuf {
-  let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
-  parent.join("codexmanager.rpc-token")
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join("codexmanager.rpc-token")
 }
 
 fn apply_runtime_storage_env(app: &tauri::AppHandle) {
-  if let Ok(data_path) = resolve_db_path_with_legacy_migration(app) {
-    std::env::set_var("CODEXMANAGER_DB_PATH", &data_path);
-    let token_path = resolve_rpc_token_path_for_db(&data_path);
-    std::env::set_var("CODEXMANAGER_RPC_TOKEN_FILE", &token_path);
-    log::info!("db path: {}", data_path.display());
-    log::info!("rpc token path: {}", token_path.display());
-  }
+    if let Ok(data_path) = resolve_db_path_with_legacy_migration(app) {
+        std::env::set_var("CODEXMANAGER_DB_PATH", &data_path);
+        let token_path = resolve_rpc_token_path_for_db(&data_path);
+        std::env::set_var("CODEXMANAGER_RPC_TOKEN_FILE", &token_path);
+        log::info!("db path: {}", data_path.display());
+        log::info!("rpc token path: {}", token_path.display());
+    }
 }
 
 fn resolve_db_path_with_legacy_migration(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-  let mut data_dir = app
-    .path()
-    .app_data_dir()
-    .map_err(|_| "app data dir not found".to_string())?;
-  if let Err(err) = fs::create_dir_all(&data_dir) {
-    log::warn!("Failed to create app data dir: {}", err);
-  }
-  data_dir.push("codexmanager.db");
-  maybe_migrate_legacy_db(&data_dir);
-  Ok(data_dir)
+    let mut data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "app data dir not found".to_string())?;
+    if let Err(err) = fs::create_dir_all(&data_dir) {
+        log::warn!("Failed to create app data dir: {}", err);
+    }
+    data_dir.push("codexmanager.db");
+    maybe_migrate_legacy_db(&data_dir);
+    Ok(data_dir)
 }
 
 fn maybe_migrate_legacy_db(current_db: &Path) {
-  let current_has_data = db_has_user_data(current_db);
-  if current_has_data {
-    return;
-  }
-
-  let needs_bootstrap = !current_db.is_file() || !current_has_data;
-  if !needs_bootstrap {
-    return;
-  }
-
-  for legacy_db in legacy_db_candidates(current_db) {
-    if !legacy_db.is_file() {
-      continue;
-    }
-    if !db_has_user_data(&legacy_db) {
-      continue;
-    }
-
-    if let Some(parent) = current_db.parent() {
-      let _ = fs::create_dir_all(parent);
-    }
-
-    if current_db.is_file() {
-      let backup = current_db.with_extension("db.empty.bak");
-      if let Err(err) = fs::copy(current_db, &backup) {
-        log::warn!(
-          "Failed to backup empty current db {} -> {}: {}",
-          current_db.display(),
-          backup.display(),
-          err
-        );
-      }
-    }
-
-    match fs::copy(&legacy_db, current_db) {
-      Ok(_) => {
-        log::info!(
-          "Migrated legacy db {} -> {}",
-          legacy_db.display(),
-          current_db.display()
-        );
+    let current_has_data = db_has_user_data(current_db);
+    if current_has_data {
         return;
-      }
-      Err(err) => {
-        log::warn!(
-          "Failed to migrate legacy db {} -> {}: {}",
-          legacy_db.display(),
-          current_db.display(),
-          err
-        );
-      }
     }
-  }
+
+    let needs_bootstrap = !current_db.is_file() || !current_has_data;
+    if !needs_bootstrap {
+        return;
+    }
+
+    for legacy_db in legacy_db_candidates(current_db) {
+        if !legacy_db.is_file() {
+            continue;
+        }
+        if !db_has_user_data(&legacy_db) {
+            continue;
+        }
+
+        if let Some(parent) = current_db.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        if current_db.is_file() {
+            let backup = current_db.with_extension("db.empty.bak");
+            if let Err(err) = fs::copy(current_db, &backup) {
+                log::warn!(
+                    "Failed to backup empty current db {} -> {}: {}",
+                    current_db.display(),
+                    backup.display(),
+                    err
+                );
+            }
+        }
+
+        match fs::copy(&legacy_db, current_db) {
+            Ok(_) => {
+                log::info!(
+                    "Migrated legacy db {} -> {}",
+                    legacy_db.display(),
+                    current_db.display()
+                );
+                return;
+            }
+            Err(err) => {
+                log::warn!(
+                    "Failed to migrate legacy db {} -> {}: {}",
+                    legacy_db.display(),
+                    current_db.display(),
+                    err
+                );
+            }
+        }
+    }
 }
 
 fn db_has_user_data(path: &Path) -> bool {
-  if !path.is_file() {
-    return false;
-  }
-  let storage = match Storage::open(path) {
-    Ok(storage) => storage,
-    Err(_) => return false,
-  };
-  let _ = storage.init();
-  storage
-    .list_accounts()
-    .map(|items| !items.is_empty())
-    .unwrap_or(false)
-    || storage
-      .list_tokens()
-      .map(|items| !items.is_empty())
-      .unwrap_or(false)
-    || storage
-      .list_api_keys()
-      .map(|items| !items.is_empty())
-      .unwrap_or(false)
+    if !path.is_file() {
+        return false;
+    }
+    let storage = match Storage::open(path) {
+        Ok(storage) => storage,
+        Err(_) => return false,
+    };
+    let _ = storage.init();
+    storage
+        .list_accounts()
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+        || storage
+            .list_tokens()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
+        || storage
+            .list_api_keys()
+            .map(|items| !items.is_empty())
+            .unwrap_or(false)
 }
 
 fn legacy_db_candidates(current_db: &Path) -> Vec<PathBuf> {
-  let mut out = Vec::new();
+    let mut out = Vec::new();
 
-  if let Some(parent) = current_db.parent() {
-    out.push(parent.join("gpttools.db"));
-    if parent
-      .file_name()
-      .and_then(|name| name.to_str())
-      .is_some_and(|name| name.eq_ignore_ascii_case("com.codexmanager.desktop"))
-    {
-      if let Some(root) = parent.parent() {
-        out.push(root.join("com.gpttools.desktop").join("gpttools.db"));
-      }
+    if let Some(parent) = current_db.parent() {
+        out.push(parent.join("gpttools.db"));
+        if parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("com.codexmanager.desktop"))
+        {
+            if let Some(root) = parent.parent() {
+                out.push(root.join("com.gpttools.desktop").join("gpttools.db"));
+            }
+        }
     }
-  }
 
-  out.retain(|candidate| candidate != current_db);
-  let mut dedup = Vec::new();
-  for candidate in out {
-    if !dedup.iter().any(|item| item == &candidate) {
-      dedup.push(candidate);
+    out.retain(|candidate| candidate != current_db);
+    let mut dedup = Vec::new();
+    for candidate in out {
+        if !dedup.iter().any(|item| item == &candidate) {
+            dedup.push(candidate);
+        }
     }
-  }
-  dedup
+    dedup
 }
 
 fn normalize_addr(raw: &str) -> Result<String, String> {
-  let trimmed = raw.trim();
-  if trimmed.is_empty() {
-    return Err("addr is empty".to_string());
-  }
-  let mut value = trimmed;
-  if let Some(rest) = value.strip_prefix("http://") {
-    value = rest;
-  }
-  if let Some(rest) = value.strip_prefix("https://") {
-    value = rest;
-  }
-  let value = value.split('/').next().unwrap_or(value);
-  if value.contains(':') {
-    Ok(normalize_host(value))
-  } else {
-    Ok(format!("localhost:{value}"))
-  }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("addr is empty".to_string());
+    }
+    let mut value = trimmed;
+    if let Some(rest) = value.strip_prefix("http://") {
+        value = rest;
+    }
+    if let Some(rest) = value.strip_prefix("https://") {
+        value = rest;
+    }
+    let value = value.split('/').next().unwrap_or(value);
+    if value.contains(':') {
+        Ok(normalize_host(value))
+    } else {
+        Ok(format!("localhost:{value}"))
+    }
+}
+
+fn clean_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+fn is_loopback_service_addr(addr: Option<&str>) -> bool {
+    let Ok(resolved) = (match addr {
+        Some(value) => normalize_addr(value),
+        None => resolve_service_addr(None),
+    }) else {
+        return false;
+    };
+    let host = resolved
+        .rsplit_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or("localhost");
+    is_loopback_host(host)
+}
+
+fn codex_auth_dir() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+    Ok(PathBuf::from(home).join(CODEX_AUTH_DIR_NAME))
+}
+
+fn codex_auth_file_path() -> Result<PathBuf, String> {
+    Ok(codex_auth_dir()?.join(CODEX_AUTH_FILE_NAME))
+}
+
+fn codex_app_installed() -> bool {
+    Path::new(CODEX_APP_PATH).is_dir() && Path::new(CODEX_CLI_PATH).is_file()
+}
+
+fn codex_app_running() -> bool {
+    let output = Command::new("pgrep")
+        .args(["-f", CODEX_APP_EXECUTABLE_PATH])
+        .output();
+    matches!(output, Ok(result) if result.status.success())
+}
+
+fn build_codex_app_status(addr: Option<&str>) -> Result<CodexAppStatusResult, String> {
+    let local_service = is_loopback_service_addr(addr);
+    let auth_path = codex_auth_file_path()?;
+    let installed = codex_app_installed();
+    let running = installed && codex_app_running();
+    let auth_file_exists = auth_path.is_file();
+    let supported = cfg!(target_os = "macos") && installed && local_service;
+    let reason = if !cfg!(target_os = "macos") {
+        Some("仅支持 macOS 桌面端同步到 Codex App".to_string())
+    } else if !local_service {
+        Some("仅支持桌面端连接本机 service 时同步到 Codex App".to_string())
+    } else if !installed {
+        Some("未检测到官方 Codex App".to_string())
+    } else {
+        None
+    };
+    Ok(CodexAppStatusResult {
+        supported,
+        installed,
+        running,
+        local_service,
+        auth_file_exists,
+        app_path: Some(CODEX_APP_PATH.to_string()),
+        auth_file_path: Some(auth_path.display().to_string()),
+        reason,
+    })
+}
+
+fn sync_account_to_codex_app(
+    app: &tauri::AppHandle,
+    addr: Option<String>,
+    account_id: &str,
+) -> Result<CodexAppSyncResult, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("仅支持 macOS 桌面端同步到 Codex App".to_string());
+    }
+    if !is_loopback_service_addr(addr.as_deref()) {
+        return Err("仅支持桌面端连接本机 service 时同步到 Codex App".to_string());
+    }
+    if !codex_app_installed() {
+        return Err("未检测到官方 Codex App".to_string());
+    }
+    let normalized_account_id = account_id.trim();
+    if normalized_account_id.is_empty() {
+        return Err("accountId is required".to_string());
+    }
+
+    let db_path = resolve_db_path_with_legacy_migration(app)?;
+    let storage = Storage::open(&db_path).map_err(|err| err.to_string())?;
+    storage.init().map_err(|err| err.to_string())?;
+    let account = storage
+        .find_account_by_id(normalized_account_id)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "未找到本地账号记录".to_string())?;
+    let token = storage
+        .find_token_by_account_id(normalized_account_id)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "账号缺少本地 token，无法同步到 Codex App".to_string())?;
+    if token.access_token.trim().is_empty()
+        || token.id_token.trim().is_empty()
+        || token.refresh_token.trim().is_empty()
+    {
+        return Err("账号 token 不完整，无法同步到 Codex App".to_string());
+    }
+
+    let chatgpt_account_id = clean_string(account.chatgpt_account_id.clone())
+        .or_else(|| extract_chatgpt_account_id(&token.id_token))
+        .or_else(|| extract_chatgpt_account_id(&token.access_token))
+        .ok_or_else(|| "无法解析真实 chatgpt_account_id，无法同步到 Codex App".to_string())?;
+
+    let auth_path = codex_auth_file_path()?;
+    if let Some(parent) = auth_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create codex auth dir failed ({}): {err}", parent.display()))?;
+    }
+    validate_existing_codex_auth_file(&auth_path)?;
+
+    let running_before_sync = codex_app_running();
+    if running_before_sync {
+        request_codex_app_quit()?;
+        wait_for_codex_app_running(false, Duration::from_secs(10))?;
+    }
+
+    let payload = CodexAuthFilePayload {
+        auth_mode: "chatgpt".to_string(),
+        openai_api_key: None,
+        tokens: CodexAuthTokensPayload {
+            access_token: token.access_token,
+            id_token: token.id_token,
+            refresh_token: token.refresh_token,
+            account_id: chatgpt_account_id.clone(),
+        },
+        last_refresh: codexmanager_core::storage::now_ts().to_string(),
+    };
+    let previous_backup = backup_existing_codex_auth_file(&auth_path)?;
+    write_codex_auth_file_atomic(&auth_path, &payload)?;
+
+    if let Err(err) = validate_codex_login_status() {
+        restore_codex_auth_backup(&auth_path, previous_backup.as_ref())?;
+        return Err(err);
+    }
+
+    if let Err(err) = launch_codex_app() {
+        log::warn!("Codex App launch failed after auth sync: {}", err);
+        return Ok(CodexAppSyncResult {
+            ok: true,
+            running_before_sync,
+            launched: false,
+            auth_file_path: auth_path.display().to_string(),
+            chatgpt_account_id,
+        });
+    }
+    wait_for_codex_app_running(true, Duration::from_secs(10))?;
+
+    Ok(CodexAppSyncResult {
+        ok: true,
+        running_before_sync,
+        launched: true,
+        auth_file_path: auth_path.display().to_string(),
+        chatgpt_account_id,
+    })
+}
+
+fn validate_existing_codex_auth_file(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("read codex auth file failed ({}): {err}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("官方 Codex auth.json 不是有效 JSON：{err}"))?;
+    let Some(obj) = value.as_object() else {
+        return Err("官方 Codex auth.json 结构不受支持".to_string());
+    };
+    if let Some(tokens) = obj.get("tokens") {
+        let Some(token_obj) = tokens.as_object() else {
+            return Err("官方 Codex auth.json.tokens 结构不受支持".to_string());
+        };
+        for key in ["access_token", "id_token", "refresh_token", "account_id"] {
+            if let Some(value) = token_obj.get(key) {
+                let valid = value.is_null() || value.as_str().is_some();
+                if !valid {
+                    return Err(format!("官方 Codex auth.json.tokens.{key} 结构不受支持"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn backup_existing_codex_auth_file(path: &Path) -> Result<Option<PathBuf>, String> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let backup = path.with_extension(format!(
+        "json.codexmanager.bak.{}",
+        codexmanager_core::storage::now_ts()
+    ));
+    fs::copy(path, &backup).map_err(|err| {
+        format!(
+            "backup codex auth file failed ({} -> {}): {err}",
+            path.display(),
+            backup.display()
+        )
+    })?;
+    Ok(Some(backup))
+}
+
+fn restore_codex_auth_backup(path: &Path, backup: Option<&PathBuf>) -> Result<(), String> {
+    let Some(backup_path) = backup else {
+        let _ = fs::remove_file(path);
+        return Ok(());
+    };
+    fs::copy(backup_path, path).map_err(|err| {
+        format!(
+            "restore codex auth file failed ({} -> {}): {err}",
+            backup_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn write_codex_auth_file_atomic(path: &Path, payload: &CodexAuthFilePayload) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "codex auth parent dir not found".to_string())?;
+    let temp_path = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|item| item.to_str())
+            .unwrap_or("auth.json")
+    ));
+    let json = serde_json::to_vec_pretty(payload)
+        .map_err(|err| format!("encode codex auth json failed: {err}"))?;
+    fs::write(&temp_path, json).map_err(|err| {
+        format!(
+            "write codex auth temp file failed ({}): {err}",
+            temp_path.display()
+        )
+    })?;
+    fs::rename(&temp_path, path).map_err(|err| {
+        format!(
+            "replace codex auth file failed ({} -> {}): {err}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn request_codex_app_quit() -> Result<(), String> {
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            &format!("tell application id \"{CODEX_APP_BUNDLE_ID}\" to quit"),
+        ])
+        .status()
+        .map_err(|err| format!("request Codex App quit failed: {err}"))?;
+    if !status.success() {
+        return Err("Codex App 退出请求失败".to_string());
+    }
+    Ok(())
+}
+
+fn launch_codex_app() -> Result<(), String> {
+    let status = Command::new("open")
+        .args(["-b", CODEX_APP_BUNDLE_ID])
+        .status()
+        .map_err(|err| format!("launch Codex App failed: {err}"))?;
+    if !status.success() {
+        return Err("Codex App 启动失败".to_string());
+    }
+    Ok(())
+}
+
+fn wait_for_codex_app_running(expected: bool, timeout: Duration) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    while started.elapsed() <= timeout {
+        if codex_app_running() == expected {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    if expected {
+        Err("Codex App 未能在超时内启动".to_string())
+    } else {
+        Err("Codex App 未能在超时内退出，请先手动关闭官方 App".to_string())
+    }
+}
+
+fn validate_codex_login_status() -> Result<(), String> {
+    let output = Command::new(CODEX_CLI_PATH)
+        .args(["login", "status"])
+        .output()
+        .map_err(|err| format!("run codex login status failed: {err}"))?;
+    if !output.status.success() {
+        return Err("官方 Codex 登录态校验失败".to_string());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.contains("Logged in using ChatGPT") {
+        return Err("官方 Codex 登录态校验未返回 ChatGPT 登录成功".to_string());
+    }
+    Ok(())
 }
 
 fn resolve_service_addr(addr: Option<String>) -> Result<String, String> {
-  if let Some(addr) = addr {
-    return normalize_addr(&addr);
-  }
-  if let Ok(env_addr) = std::env::var("CODEXMANAGER_SERVICE_ADDR") {
-    if let Ok(addr) = normalize_addr(&env_addr) {
-      return Ok(addr);
+    if let Some(addr) = addr {
+        return normalize_addr(&addr);
     }
-  }
-  Ok(codexmanager_service::DEFAULT_ADDR.to_string())
+    if let Ok(env_addr) = std::env::var("CODEXMANAGER_SERVICE_ADDR") {
+        if let Ok(addr) = normalize_addr(&env_addr) {
+            return Ok(addr);
+        }
+    }
+    Ok(codexmanager_service::DEFAULT_ADDR.to_string())
 }
 
 fn split_http_response(buf: &str) -> Option<(&str, &str)> {
-  if let Some((headers, body)) = buf.split_once("\r\n\r\n") {
-    return Some((headers, body));
-  }
-  if let Some((headers, body)) = buf.split_once("\n\n") {
-    return Some((headers, body));
-  }
-  None
+    if let Some((headers, body)) = buf.split_once("\r\n\r\n") {
+        return Some((headers, body));
+    }
+    if let Some((headers, body)) = buf.split_once("\n\n") {
+        return Some((headers, body));
+    }
+    None
 }
 
 fn response_uses_chunked(headers: &str) -> bool {
-  headers.lines().any(|line| {
-    let Some((name, value)) = line.split_once(':') else {
-      return false;
-    };
-    name.trim().eq_ignore_ascii_case("transfer-encoding")
-      && value.to_ascii_lowercase().contains("chunked")
-  })
+    headers.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+    })
 }
 
 fn decode_chunked_body(raw: &str) -> Result<String, String> {
-  let bytes = raw.as_bytes();
-  let mut cursor = 0usize;
-  let mut out = Vec::<u8>::new();
+    let bytes = raw.as_bytes();
+    let mut cursor = 0usize;
+    let mut out = Vec::<u8>::new();
 
-  loop {
-    let Some(line_end_rel) = bytes[cursor..].windows(2).position(|w| w == b"\r\n") else {
-      return Err("Invalid chunked body: missing chunk size line".to_string());
-    };
-    let line_end = cursor + line_end_rel;
-    let line = std::str::from_utf8(&bytes[cursor..line_end])
-      .map_err(|err| format!("Invalid chunked body: chunk size is not utf8 ({err})"))?;
-    let size_hex = line.split(';').next().unwrap_or("").trim();
-    let size = usize::from_str_radix(size_hex, 16)
-      .map_err(|_| format!("Invalid chunked body: bad chunk size '{size_hex}'"))?;
-    cursor = line_end + 2;
-    if size == 0 {
-      break;
+    loop {
+        let Some(line_end_rel) = bytes[cursor..].windows(2).position(|w| w == b"\r\n") else {
+            return Err("Invalid chunked body: missing chunk size line".to_string());
+        };
+        let line_end = cursor + line_end_rel;
+        let line = std::str::from_utf8(&bytes[cursor..line_end])
+            .map_err(|err| format!("Invalid chunked body: chunk size is not utf8 ({err})"))?;
+        let size_hex = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|_| format!("Invalid chunked body: bad chunk size '{size_hex}'"))?;
+        cursor = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        let end = cursor.saturating_add(size);
+        if end + 2 > bytes.len() {
+            return Err("Invalid chunked body: truncated chunk payload".to_string());
+        }
+        out.extend_from_slice(&bytes[cursor..end]);
+        if &bytes[end..end + 2] != b"\r\n" {
+            return Err("Invalid chunked body: missing chunk terminator".to_string());
+        }
+        cursor = end + 2;
     }
-    let end = cursor.saturating_add(size);
-    if end + 2 > bytes.len() {
-      return Err("Invalid chunked body: truncated chunk payload".to_string());
-    }
-    out.extend_from_slice(&bytes[cursor..end]);
-    if &bytes[end..end + 2] != b"\r\n" {
-      return Err("Invalid chunked body: missing chunk terminator".to_string());
-    }
-    cursor = end + 2;
-  }
 
-  String::from_utf8(out).map_err(|err| format!("Invalid chunked body utf8 payload: {err}"))
+    String::from_utf8(out).map_err(|err| format!("Invalid chunked body utf8 payload: {err}"))
 }
 
 fn parse_http_body(buf: &str) -> Result<String, String> {
-  let Some((headers, body_raw)) = split_http_response(buf) else {
-    // 中文注释：旧实现按原始 socket 读取，理论上总是 HTTP 报文；但在代理/半关闭边界上可能只拿到 body。
-    // 这里回退为“整段按 body 处理”，避免把可解析的 JSON 误判成 malformed。
-    return Ok(buf.to_string());
-  };
-  if response_uses_chunked(headers) {
-    decode_chunked_body(body_raw)
-  } else {
-    Ok(body_raw.to_string())
-  }
+    let Some((headers, body_raw)) = split_http_response(buf) else {
+        // 中文注释：旧实现按原始 socket 读取，理论上总是 HTTP 报文；但在代理/半关闭边界上可能只拿到 body。
+        // 这里回退为“整段按 body 处理”，避免把可解析的 JSON 误判成 malformed。
+        return Ok(buf.to_string());
+    };
+    if response_uses_chunked(headers) {
+        decode_chunked_body(body_raw)
+    } else {
+        Ok(body_raw.to_string())
+    }
 }
 
 fn resolve_socket_addrs(addr: &str) -> Result<Vec<SocketAddr>, String> {
-  let addrs = addr
-    .to_socket_addrs()
-    .map_err(|err| format!("Invalid service address {addr}: {err}"))?;
-  let mut out = Vec::new();
-  for sock in addrs {
-    if !out.iter().any(|item| item == &sock) {
-      out.push(sock);
+    let addrs = addr
+        .to_socket_addrs()
+        .map_err(|err| format!("Invalid service address {addr}: {err}"))?;
+    let mut out = Vec::new();
+    for sock in addrs {
+        if !out.iter().any(|item| item == &sock) {
+            out.push(sock);
+        }
     }
-  }
-  if out.is_empty() {
-    return Err(format!("Invalid service address {addr}: no address resolved"));
-  }
-  Ok(out)
+    if out.is_empty() {
+        return Err(format!(
+            "Invalid service address {addr}: no address resolved"
+        ));
+    }
+    Ok(out)
 }
 
 fn rpc_call_on_socket(
-  method: &str,
-  addr: &str,
-  sock: SocketAddr,
-  params: Option<serde_json::Value>,
+    method: &str,
+    addr: &str,
+    sock: SocketAddr,
+    params: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-  let mut stream = TcpStream::connect_timeout(&sock, Duration::from_millis(400)).map_err(|e| {
-    let msg = format!("Failed to connect to service at {addr}: {e}");
-    log::warn!("rpc connect failed ({} -> {} via {}): {}", method, addr, sock, e);
-    msg
-  })?;
-  let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-  let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let mut stream =
+        TcpStream::connect_timeout(&sock, Duration::from_millis(400)).map_err(|e| {
+            let msg = format!("Failed to connect to service at {addr}: {e}");
+            log::warn!(
+                "rpc connect failed ({} -> {} via {}): {}",
+                method,
+                addr,
+                sock,
+                e
+            );
+            msg
+        })?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
-  let req = JsonRpcRequest {
-    id: 1,
-    method: method.to_string(),
-    params,
-  };
-  let json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-  let rpc_token = codexmanager_service::rpc_auth_token();
-  let http = format!(
+    let req = JsonRpcRequest {
+        id: 1,
+        method: method.to_string(),
+        params,
+    };
+    let json = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+    let rpc_token = codexmanager_service::rpc_auth_token();
+    let http = format!(
     "POST /rpc HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-CodexManager-Rpc-Token: {rpc_token}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
     json.len(),
     json
   );
-  stream.write_all(http.as_bytes()).map_err(|e| {
-    let msg = e.to_string();
-    log::warn!("rpc write failed ({} -> {} via {}): {}", method, addr, sock, msg);
-    msg
-  })?;
+    stream.write_all(http.as_bytes()).map_err(|e| {
+        let msg = e.to_string();
+        log::warn!(
+            "rpc write failed ({} -> {} via {}): {}",
+            method,
+            addr,
+            sock,
+            msg
+        );
+        msg
+    })?;
 
-  let mut buf = String::new();
-  stream.read_to_string(&mut buf).map_err(|e| {
-    let msg = e.to_string();
-    log::warn!("rpc read failed ({} -> {} via {}): {}", method, addr, sock, msg);
-    msg
-  })?;
-  let body = parse_http_body(&buf).map_err(|msg| {
-    log::warn!("rpc parse failed ({} -> {} via {}): {}", method, addr, sock, msg);
-    msg
-  })?;
-  if body.trim().is_empty() {
-    log::warn!("rpc empty response ({} -> {} via {})", method, addr, sock);
-    return Err("Empty response from service (service not ready, exited, or port occupied)".to_string());
-  }
+    let mut buf = String::new();
+    stream.read_to_string(&mut buf).map_err(|e| {
+        let msg = e.to_string();
+        log::warn!(
+            "rpc read failed ({} -> {} via {}): {}",
+            method,
+            addr,
+            sock,
+            msg
+        );
+        msg
+    })?;
+    let body = parse_http_body(&buf).map_err(|msg| {
+        log::warn!(
+            "rpc parse failed ({} -> {} via {}): {}",
+            method,
+            addr,
+            sock,
+            msg
+        );
+        msg
+    })?;
+    if body.trim().is_empty() {
+        log::warn!("rpc empty response ({} -> {} via {})", method, addr, sock);
+        return Err(
+            "Empty response from service (service not ready, exited, or port occupied)".to_string(),
+        );
+    }
 
-  let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-    let msg = format!("Unexpected RPC response (non-JSON body): {e}");
-    log::warn!(
-      "rpc json parse failed ({} -> {} via {}): {}",
-      method,
-      addr,
-      sock,
-      msg
-    );
-    msg
-  })?;
-  if let Some(err) = v.get("error") {
-    log::warn!("rpc error ({} -> {} via {}): {}", method, addr, sock, err);
-  }
-  Ok(v)
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        let msg = format!("Unexpected RPC response (non-JSON body): {e}");
+        log::warn!(
+            "rpc json parse failed ({} -> {} via {}): {}",
+            method,
+            addr,
+            sock,
+            msg
+        );
+        msg
+    })?;
+    if let Some(err) = v.get("error") {
+        log::warn!("rpc error ({} -> {} via {}): {}", method, addr, sock, err);
+    }
+    Ok(v)
 }
 
 fn rpc_call_with_sockets(
-  method: &str,
-  addr: &str,
-  socket_addrs: &[SocketAddr],
-  params: Option<serde_json::Value>,
+    method: &str,
+    addr: &str,
+    socket_addrs: &[SocketAddr],
+    params: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-  if socket_addrs.is_empty() {
-    return Err(format!("Invalid service address {addr}: no address resolved"));
-  }
-  let mut last_err = "Empty response from service (service not ready, exited, or port occupied)".to_string();
-  for attempt in 0..=1 {
-    for sock in socket_addrs {
-      match rpc_call_on_socket(method, addr, *sock, params.clone()) {
-        Ok(v) => return Ok(v),
-        Err(err) => last_err = err,
-      }
+    if socket_addrs.is_empty() {
+        return Err(format!(
+            "Invalid service address {addr}: no address resolved"
+        ));
     }
-    if attempt == 0 {
-      std::thread::sleep(Duration::from_millis(120));
+    let mut last_err =
+        "Empty response from service (service not ready, exited, or port occupied)".to_string();
+    for attempt in 0..=1 {
+        for sock in socket_addrs {
+            match rpc_call_on_socket(method, addr, *sock, params.clone()) {
+                Ok(v) => return Ok(v),
+                Err(err) => last_err = err,
+            }
+        }
+        if attempt == 0 {
+            std::thread::sleep(Duration::from_millis(120));
+        }
     }
-  }
-  Err(last_err)
+    Err(last_err)
 }
 
 fn rpc_call(
-  method: &str,
-  addr: Option<String>,
-  params: Option<serde_json::Value>,
+    method: &str,
+    addr: Option<String>,
+    params: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-  let addr = resolve_service_addr(addr)?;
-  let socket_addrs = resolve_socket_addrs(&addr)?;
-  rpc_call_with_sockets(method, &addr, &socket_addrs, params)
+    let addr = resolve_service_addr(addr)?;
+    let socket_addrs = resolve_socket_addrs(&addr)?;
+    rpc_call_with_sockets(method, &addr, &socket_addrs, params)
 }
 
 fn normalize_host(value: &str) -> String {
-  if let Some((host, port)) = value.rsplit_once(':') {
-    let mapped = match host {
-      "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]" => "localhost",
-      _ => host,
-    };
-    format!("{mapped}:{port}")
-  } else {
-    value.to_string()
-  }
+    if let Some((host, port)) = value.rsplit_once(':') {
+        let mapped = match host {
+            "127.0.0.1" | "0.0.0.0" | "::1" | "[::1]" => "localhost",
+            _ => host,
+        };
+        format!("{mapped}:{port}")
+    } else {
+        value.to_string()
+    }
 }
 
 struct ServiceRuntime {
-  addr: String,
-  join: thread::JoinHandle<()>,
+    addr: String,
+    join: thread::JoinHandle<()>,
 }
 
 static SERVICE_RUNTIME: OnceLock<Mutex<Option<ServiceRuntime>>> = OnceLock::new();
 
 fn set_service_runtime(runtime: ServiceRuntime) {
-  let slot = SERVICE_RUNTIME.get_or_init(|| Mutex::new(None));
-  if let Ok(mut guard) = slot.lock() {
-    *guard = Some(runtime);
-  }
+    let slot = SERVICE_RUNTIME.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(runtime);
+    }
 }
 
 fn take_service_runtime() -> Option<ServiceRuntime> {
-  let slot = SERVICE_RUNTIME.get_or_init(|| Mutex::new(None));
-  if let Ok(mut guard) = slot.lock() {
-    guard.take()
-  } else {
-    None
-  }
+    let slot = SERVICE_RUNTIME.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        guard.take()
+    } else {
+        None
+    }
 }
 
 fn stop_service() {
-  if let Some(runtime) = take_service_runtime() {
-    log::info!("service stopping at {}", runtime.addr);
-    codexmanager_service::request_shutdown(&runtime.addr);
-    thread::spawn(move || {
-      let _ = runtime.join.join();
-    });
-  }
+    if let Some(runtime) = take_service_runtime() {
+        log::info!("service stopping at {}", runtime.addr);
+        codexmanager_service::request_shutdown(&runtime.addr);
+        thread::spawn(move || {
+            let _ = runtime.join.join();
+        });
+    }
 }
 
 fn wait_for_service_ready(addr: &str, retries: usize, delay: Duration) -> Result<(), String> {
-  let mut last_err = "service bootstrap check failed".to_string();
-  for attempt in 0..=retries {
-    match rpc_call("initialize", Some(addr.to_string()), None) {
-      Ok(v) => {
-        let server_name = v
-          .get("result")
-          .and_then(|r| r.get("server_name"))
-          .and_then(|s| s.as_str())
-          .unwrap_or("");
-        if server_name == "codexmanager-service" {
-          return Ok(());
+    let mut last_err = "service bootstrap check failed".to_string();
+    for attempt in 0..=retries {
+        match rpc_call("initialize", Some(addr.to_string()), None) {
+            Ok(v) => {
+                let server_name = v
+                    .get("result")
+                    .and_then(|r| r.get("server_name"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("");
+                if server_name == "codexmanager-service" {
+                    return Ok(());
+                }
+                last_err = if server_name.is_empty() {
+                    "missing server_name".to_string()
+                } else {
+                    format!("unexpected server_name={server_name}")
+                };
+            }
+            Err(err) => {
+                last_err = err;
+            }
         }
-        last_err = if server_name.is_empty() {
-          "missing server_name".to_string()
-        } else {
-          format!("unexpected server_name={server_name}")
-        };
-      }
-      Err(err) => {
-        last_err = err;
-      }
+        if attempt < retries {
+            std::thread::sleep(delay);
+        }
     }
-    if attempt < retries {
-      std::thread::sleep(delay);
-    }
-  }
-  Err(last_err)
+    Err(last_err)
 }
 
 #[cfg(test)]
 #[path = "tests/lib_tests.rs"]
 mod tests;
-
